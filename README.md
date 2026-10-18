@@ -10,6 +10,7 @@ reach the upstream NAT router.
 - Requests saved port mappings upstream, by hand or when the WAN comes up.
 - Lets you add a mapping by hand on the page. It is requested from the upstream NAT router, with an option to also create a firewall4 port forward from this device to a LAN device.
 - Shows which mappings you added by hand and which were relayed from LAN devices.
+- The relay table and status refresh by themselves every few seconds. The upstream list only queries when you click its button.
 - Relays ports that LAN devices request from miniupnpd, and removes
   them upstream when the lease ends.
 - Applies and reverts the miniupnpd setting needed for a private WAN
@@ -22,7 +23,7 @@ reach the upstream NAT router.
 
 ## Install
 
-    opkg install luci-app-upnp-client_1.2.0-4_all.ipk
+    opkg install luci-app-upnp-client_1.3.0-1_all.ipk
 
 Then open Services, UPnP Client in LuCI. The switch starts off.
 

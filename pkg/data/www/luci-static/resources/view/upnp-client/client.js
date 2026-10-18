@@ -1,5 +1,6 @@
 'use strict';
 'require view';
+'require poll';
 'require rpc';
 'require ui';
 'require dom';
@@ -53,6 +54,34 @@ var relayBox = E('div', { 'class': 'cbi-section' }, [
     E('table', { 'class': 'table cbi-section-table' }, [ relayHead ].concat(relayRows))
 ]);
 		var enabled = !!status.enabled;
+var relayShown = JSON.stringify(relayed);
+function fillRelay(list) {
+    while (relayBox.firstChild) relayBox.removeChild(relayBox.firstChild);
+    var rows = list.map(function(r) {
+        return E('tr', {}, [
+            E('td', {}, [ r.port || '' ]),
+            E('td', {}, [ r.proto || '' ]),
+            E('td', {}, [ _('MiniUPnPd relay | LAN ') + (r.lan || '?') ])
+        ]);
+    });
+    var note = list.length ? '' : _('No ports are being relayed from LAN devices right now.');
+    relayBox.appendChild(E('h3', {}, [ _('Relayed from LAN devices') ]));
+    relayBox.appendChild(E('p', {}, [ note ]));
+    relayBox.appendChild(E('table', { 'class': 'table cbi-section-table' },
+        [ relayHead.cloneNode(true) ].concat(rows)));
+}
+poll.add(function() {
+    return Promise.all([ callStatus(), callMappings() ]).then(function(d) {
+        var st = d[0] || {}, rl = (d[1] && d[1].relayed) || [];
+        var changed = st.enabled !== status.enabled
+            || st.nat_state !== status.nat_state
+            || st.router_url_found !== status.router_url_found
+            || st.wan_ip !== status.wan_ip;
+        if (changed) return reloadView();
+        var now = JSON.stringify(rl);
+        if (now !== relayShown) { relayShown = now; fillRelay(rl); }
+    });
+}, 5);
 		var enabledBox = E('input', { 'type': 'checkbox', 'checked': enabled, 'change': function(ev) {
 			var value = ev.target.checked;
 			callEnable(value).then(function(r) { notifyResult(r); reloadView(); }).catch(function(e) { ev.target.checked = !value; ui.addNotification(null, E('p', {}, _('Could not change enabled state: ') + e), 'error'); });
