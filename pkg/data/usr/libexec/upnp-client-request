@@ -4,6 +4,12 @@
 . /lib/functions/network.sh
 
 CONFIG='upnp-client'
+fw_reload() {
+    /etc/init.d/firewall reload >/dev/null 2>&1
+    local rc=$?
+    /etc/init.d/miniupnpd restart >/dev/null 2>&1
+    return $rc
+}
 ensure_ssdp_rule() {
     local gw cur
     network_get_gateway gw "$WAN_IF"
@@ -17,15 +23,14 @@ ensure_ssdp_rule() {
     uci set firewall.upnpclient_ssdp.src_port='1900'
     uci set firewall.upnpclient_ssdp.proto='udp'
     uci set firewall.upnpclient_ssdp.target='ACCEPT'
-    uci set firewall.upnpclient_ssdp.upnp_client_managed='1'
     uci commit firewall
-    /etc/init.d/firewall reload >/dev/null 2>&1
+    fw_reload
 }
 remove_ssdp_rule() {
     uci -q get firewall.upnpclient_ssdp >/dev/null || return 0
     uci -q delete firewall.upnpclient_ssdp
     uci commit firewall
-    /etc/init.d/firewall reload >/dev/null 2>&1
+    fw_reload
 }
 WAN_IF="$(uci -q get "$CONFIG.main.wan_interface")"
 [ -n "$WAN_IF" ] || WAN_IF='wan'
@@ -104,9 +109,8 @@ apply_local_forward() {
         uci set "firewall.$fwname.src_dport=$port"
         uci set "firewall.$fwname.dest_ip=$lan_ip"
         uci set "firewall.$fwname.dest_port=$lan_port"
-        uci set "firewall.$fwname.upnp_client_managed=1"
         uci commit firewall || return 1
-        /etc/init.d/firewall reload >/dev/null 2>&1 || { echo "Upstream mapping succeeded, but firewall reload failed"; return 1; }
+        fw_reload || { echo "Upstream mapping succeeded, but firewall reload failed"; return 1; }
         echo "LAN forward applied to $lan_ip:$lan_port."
         return 0
     done
@@ -127,10 +131,13 @@ unrequest_mapping() {
     local port="$1" proto="$2" output rc fwname
     valid_port "$port" && valid_proto "$proto" || { echo 'Invalid port or protocol'; return 2; }
     output="$(upnpc -u "$URL" -d "$port" "$proto" 2>&1)"; rc=$?
+    if [ "$rc" -eq 0 ] || printf '%s' "$output" | grep -q 'code : 714'; then
+        sed -i "/^$proto $port /d" /tmp/upnp-client-sync.applied 2>/dev/null
+    fi
     printf '%s\n' "$output"
     fwname="upnpclient_${port}_$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
-    if [ "$(uci -q get "firewall.$fwname.upnp_client_managed")" = 1 ]; then
-        uci -q delete "firewall.$fwname" && uci commit firewall && /etc/init.d/firewall reload >/dev/null 2>&1 || { echo 'Removed upstream mapping, but failed to remove the package-owned LAN redirect'; return 1; }
+    if [ "$(uci -q get "firewall.$fwname")" = redirect ]; then
+        uci -q delete "firewall.$fwname" && uci commit firewall && fw_reload || { echo 'Removed upstream mapping, but failed to remove the package-owned LAN redirect'; return 1; }
         echo 'Package-owned LAN redirect removed.'
     fi
     return "$rc"

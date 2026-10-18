@@ -41,6 +41,7 @@ case "${1:-}" in
         json_add_string port "$port"
         json_add_string proto "$pr"
         json_add_string source daemon
+        json_add_string lan "$(awk -F: -v p="$port" -v r="$pr" '$1==r && $2==p {print $3; exit}' /var/run/miniupnpd.leases 2>/dev/null)"
         json_close_object
       done < /tmp/upnp-client-sync.applied
       json_close_array

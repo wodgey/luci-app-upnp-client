@@ -33,6 +33,25 @@ return view.extend({
 	load: function() { return Promise.all([ callStatus(), callMappings() ]); },
 	render: function(data) {
 		var status = data[0] || {}, mappings = (data[1] && data[1].mappings) || [];
+var relayed = (data[1] && data[1].relayed) || [];
+var relayHead = E('tr', { 'class': 'tr table-titles' }, [
+    E('th', { 'class': 'th' }, [ _('Port') ]),
+    E('th', { 'class': 'th' }, [ _('Protocol') ]),
+    E('th', { 'class': 'th' }, [ _('Added by') ])
+]);
+var relayRows = relayed.map(function(r) {
+    return E('tr', {}, [
+        E('td', {}, [ r.port || '' ]),
+        E('td', {}, [ r.proto || '' ]),
+        E('td', {}, [ _('MiniUPnPd relay | LAN ') + (r.lan || '?') ])
+    ]);
+});
+var relayNote = relayed.length ? '' : _('No ports are being relayed from LAN devices right now.');
+var relayBox = E('div', { 'class': 'cbi-section' }, [
+    E('h3', {}, [ _('Relayed from LAN devices') ]),
+    E('p', {}, [ relayNote ]),
+    E('table', { 'class': 'table cbi-section-table' }, [ relayHead ].concat(relayRows))
+]);
 		var enabled = !!status.enabled;
 		var enabledBox = E('input', { 'type': 'checkbox', 'checked': enabled, 'change': function(ev) {
 			var value = ev.target.checked;
@@ -90,7 +109,7 @@ var urlBox = E('div', {}, [
 
 		var tableRows = mappings.map(function(m) {
 			return E('tr', {}, [
-				E('td', {}, [ m.port || '' ]), E('td', {}, [ m.proto || '' ]),
+				E('td', {}, [ m.port || '' ]), E('td', {}, [ m.proto || '' ]), E('td', {}, [ _('manual') ]),
 				E('td', {}, [ E('input', { 'type': 'checkbox', 'checked': !!m.auto, 'change': function(ev) { callAuto(m.section, ev.target.checked).then(notifyResult).catch(function(e) { ui.addNotification(null, E('p', {}, String(e)), 'error'); }); } }) ]),
 				E('td', {}, [ button(_('Request now'), 'cbi-button cbi-button-action', function() { return callRequest(m.port, m.proto).then(notifyResult); }), ' ', button(_('Unrequest'), 'cbi-button-negative', function() { if (!confirm(_('Remove this port/protocol mapping from the upstream NAT router?'))) return; return callUnrequest(m.port, m.proto).then(notifyResult); }), ' ', button(_('Remove saved entry'), 'cbi-button', function() { if (!confirm(_('Remove this saved entry? The upstream mapping will not be deleted.'))) return; return callRemove(m.section).then(function(r) { notifyResult(r); reloadView(); }); }) ])
 			]);
@@ -101,7 +120,8 @@ var urlBox = E('div', {}, [
 			E('p', {}, [ _('Request port mappings from the upstream NAT router. Optional LAN-side forwarding creates package-owned firewall4 redirects for IPv4 LAN targets.') ]),
 			E('div', { 'class': 'cbi-section' }, [ E('h3', {}, [ _('Client control') ]), E('p', {}, [ _('Current state: '), E('strong', {}, [ enabled ? _('Enabled') : _('Disabled') ]), ' ', button(enabled ? _('Disable') : _('Enable'), enabled ? 'cbi-button cbi-button-remove' : 'cbi-button cbi-button-apply', function() { return callEnable(!enabled).then(function(r) { notifyResult(r); reloadView(); }); }) ]), urlBox, natBox, E('p', {}, [ _('Enabling processes checked mappings immediately and activates the package-owned WAN-up hook. Disabling stops future automatic requests but does not delete existing upstream NAT router mappings.') ]) ]),
 			addSection,
-			E('div', { 'class': 'cbi-section' }, [ E('h3', {}, [ _('Configured mappings') ]), E('table', { 'class': 'table cbi-section-table' }, [ E('tr', { 'class': 'tr table-titles' }, [ E('th', { 'class': 'th' }, [ _('Port') ]), E('th', { 'class': 'th' }, [ _('Protocol') ]), E('th', { 'class': 'th' }, [ _('Automatic') ]), E('th', { 'class': 'th' }, [ _('Actions') ]) ]) ].concat(tableRows)), E('div', { 'class': 'cbi-page-actions' }, [ button(_('Request all saved mappings now'), 'cbi-button cbi-button-action', function() { return callRequestAll().then(notifyResult); }), ' ', button(_('Unrequest all managed mappings…'), 'cbi-button-negative', function() { if (!confirm(_('Delete the configured port/protocol mappings from the upstream NAT router? Only mappings matching this package’s saved entries will be attempted.'))) return; return callUnrequestAll().then(notifyResult); }) ]) ]),
+			E('div', { 'class': 'cbi-section' }, [ E('h3', {}, [ _('Configured mappings') ]), E('table', { 'class': 'table cbi-section-table' }, [ E('tr', { 'class': 'tr table-titles' }, [ E('th', { 'class': 'th' }, [ _('Port') ]), E('th', { 'class': 'th' }, [ _('Protocol') ]), E('th', { 'class': 'th' }, [ _('Added by') ]), E('th', { 'class': 'th' }, [ _('Automatic') ]), E('th', { 'class': 'th' }, [ _('Actions') ]) ]) ].concat(tableRows)), E('div', { 'class': 'cbi-page-actions' }, [ button(_('Request all saved mappings now'), 'cbi-button cbi-button-action', function() { return callRequestAll().then(notifyResult); }), ' ', button(_('Unrequest all managed mappings…'), 'cbi-button-negative', function() { if (!confirm(_('Delete the configured port/protocol mappings from the upstream NAT router? Only mappings matching this package’s saved entries will be attempted.'))) return; return callUnrequestAll().then(notifyResult); }) ]) ]),
+                    relayBox,
 			E('div', { 'class': 'cbi-section' }, [ E('h3', {}, [ _('Upstream NAT router active forwards') ]), button(_('Refresh active forwards'), 'cbi-button cbi-button-action', function() { return callRefresh().then(function(r) { upstreamOutput.textContent = (r && r.output) || _('No output returned.'); if (!r || !r.ok) notifyResult({ ok: false, message: upstreamOutput.textContent }); }); }), upstreamOutput ])
 		]);
 	}

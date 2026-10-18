@@ -10,5 +10,6 @@ if uci -q get firewall.upnpclient_ssdp >/dev/null; then
     uci -q delete firewall.upnpclient_ssdp
     uci commit firewall
     /etc/init.d/firewall reload >/dev/null 2>&1
+    /etc/init.d/miniupnpd restart >/dev/null 2>&1
 fi
 exit 0

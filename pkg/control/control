@@ -1,5 +1,5 @@
 Package: luci-app-upnp-client
-Version: 1.1.0-2
+Version: 1.2.0-4
 Depends: libc, rpcd, luci-base, miniupnpc, miniupnpd-nftables, firewall4, curl, jshn
 Section: luci
 Category: LuCI

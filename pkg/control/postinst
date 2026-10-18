@@ -19,7 +19,8 @@ touch "$CR"
 grep -q upnp-client-sync "$CR" || \
     echo '*/30 * * * * /usr/libexec/upnp-client-sync' >> "$CR"
 /etc/init.d/cron restart >/dev/null 2>&1
-/etc/init.d/upnp-client-watch enable
-/etc/init.d/upnp-client-watch restart
+[ "$(uci -q get upnp-client.main.enabled)" = 1 ] && /usr/libexec/upnp-client-request ssdp-rule add >/dev/null 2>&1
+/etc/init.d/upnp-client-watch enable >/dev/null 2>&1
+/etc/init.d/upnp-client-watch restart >/dev/null 2>&1 || /etc/init.d/upnp-client-watch start >/dev/null 2>&1
 /etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1
 exit 0
