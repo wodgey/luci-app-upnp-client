@@ -1,0 +1,135 @@
+#!/bin/sh
+# rpcd plugin for luci-app-upnp-client. Inputs are JSON objects via stdin.
+. /usr/share/libubox/jshn.sh
+CONFIG='upnp-client'
+HELPER='/usr/libexec/upnp-client-request'
+
+json_result() { json_init; json_add_boolean ok "$([ "$1" = true ] && echo 1 || echo 0)"; json_add_string message "$2"; json_dump; }
+valid_port() { case "${1:-}" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null; }
+valid_proto() { [ "${1:-}" = TCP ] || [ "${1:-}" = UDP ]; }
+case "${1:-}" in
+ list)
+   echo '{"status":{},"mappings":{},"set_enabled":{"enabled":"Boolean"},"add_mapping":{"port":"Integer","proto":"String","auto":"Boolean","lan_forward":"Boolean","lan_ip":"String","lan_port":"Integer"},"remove_mapping":{"section":"String"},"set_auto":{"section":"String","auto":"Boolean"},"request":{"port":"Integer","proto":"String"},"unrequest":{"port":"Integer","proto":"String"},"request_all":{},"unrequest_all":{},"refresh":{},"set_router_url":{"url":"String"},"nat_status":{},"nat_apply":{},"nat_revert":{}}'
+   ;;
+ call)
+   METHOD="${2:-}"
+   input="$(cat)"
+   json_load "$input"
+   case "$METHOD" in
+    status)
+      enabled="$(uci -q get "$CONFIG.main.enabled")"; [ "$enabled" = 1 ] && b=1 || b=0
+      url="$(uci -q get "$CONFIG.main.router_url")"
+      wanif="$(uci -q get "$CONFIG.main.wan_interface")"
+      ip=''; . /lib/functions/network.sh; network_get_ipaddr ip "$wanif" 2>/dev/null || true
+      json_init; json_add_boolean enabled "$b"; json_add_string router_url "$url"; found="$url"; src=configured; [ -n "$found" ] || { found="$(cat /tmp/upnp-client-url 2>/dev/null)"; src=auto; }; json_add_string router_url_found "$found"; json_add_string router_url_source "$src"; json_add_string wan_ip "$ip"; json_add_string nat_state "$($HELPER nat-setup status 2>/dev/null)"; json_dump
+      ;;
+    mappings)
+      json_init; json_add_array mappings
+      for section in $(uci -q show "$CONFIG" | sed -n 's/^upnp-client\.\([^.=]*\)=mapping$/\1/p'); do
+        port="$(uci -q get "$CONFIG.$section.port")"; proto="$(uci -q get "$CONFIG.$section.proto")"; auto="$(uci -q get "$CONFIG.$section.auto")"
+        [ -n "$port" ] && [ -n "$proto" ] || continue
+        json_add_object ''; json_add_string section "$section"; json_add_string port "$port"; json_add_string proto "$proto"
+        [ "$auto" = 1 ] && json_add_boolean auto 1 || json_add_boolean auto 0
+        json_close_object
+      done
+      json_close_array
+      touch /tmp/upnp-client-sync.applied
+      json_add_array relayed
+      while read -r pr port src; do
+        [ "$src" = L ] || continue
+        json_add_object ''
+        json_add_string port "$port"
+        json_add_string proto "$pr"
+        json_add_string source daemon
+        json_close_object
+      done < /tmp/upnp-client-sync.applied
+      json_close_array
+      json_dump
+      ;;
+    set_enabled)
+      json_get_var enabled enabled
+      if [ "$enabled" = true ] || [ "$enabled" = 1 ]; then
+        uci set "$CONFIG.main.enabled=1" || { json_result false 'Could not save enabled state'; exit 0; }
+        uci commit "$CONFIG" || { json_result false 'Could not commit configuration'; exit 0; }
+        mkdir -p /etc/hotplug.d/iface
+        target='/usr/lib/upnp-client/hotplug'
+        link='/etc/hotplug.d/iface/99-upnp-client'
+        if [ -e "$link" ] && [ ! -L "$link" ]; then json_result false "Legacy hotplug file still exists at $link; refusing to overwrite it"; exit 0; fi
+        ln -sf "$target" "$link"
+        output="$($HELPER request-auto 2>&1)"; rc=$?
+        [ "$rc" -eq 0 ] && json_result true "Enabled. Automatic requests processed. $output" || json_result false "Enabled, but one or more requests failed: $output"
+      else
+        uci set "$CONFIG.main.enabled=0" && uci commit "$CONFIG"; $HELPER ssdp-rule remove >/dev/null 2>&1
+        link='/etc/hotplug.d/iface/99-upnp-client'
+        [ -L "$link" ] && [ "$(readlink "$link")" = '/usr/lib/upnp-client/hotplug' ] && rm -f "$link"
+        json_result true 'Disabled automatic requests. Existing router mappings were left unchanged.'
+      fi
+      ;;
+    add_mapping)
+      json_get_var port port; json_get_var proto proto; json_get_var auto auto; json_get_var lan_forward lan_forward; json_get_var lan_ip lan_ip; json_get_var lan_port lan_port
+      valid_port "$port" && valid_proto "$proto" || { json_result false 'Enter a port from 1 to 65535 and select TCP or UDP.'; exit 0; }
+      for section in $(uci -q show "$CONFIG" | sed -n 's/^upnp-client\.\([^.=]*\)=mapping$/\1/p'); do
+        [ "$(uci -q get "$CONFIG.$section.port")" = "$port" ] && [ "$(uci -q get "$CONFIG.$section.proto")" = "$proto" ] && { json_result false 'That port/protocol pair is already configured.'; exit 0; }
+      done
+      section="$(uci add "$CONFIG" mapping)" || { json_result false 'Could not create mapping'; exit 0; }
+      uci set "$CONFIG.$section.port=$port"; uci set "$CONFIG.$section.proto=$proto"
+      [ "$auto" = true ] || [ "$auto" = 1 ] && auto=1 || auto=0
+      uci set "$CONFIG.$section.auto=$auto";
+      if [ "$lan_forward" = true ] || [ "$lan_forward" = 1 ]; then
+        valid_port "$lan_port" || { uci delete "$CONFIG.$section"; json_result false 'LAN port must be from 1 to 65535'; exit 0; }
+        [ -n "$lan_ip" ] || { uci delete "$CONFIG.$section"; json_result false 'LAN IP address is required when LAN-side forwarding is enabled'; exit 0; }
+        uci set "$CONFIG.$section.lan_forward=1"; uci set "$CONFIG.$section.lan_ip=$lan_ip"; uci set "$CONFIG.$section.lan_port=$lan_port"
+      else
+        uci set "$CONFIG.$section.lan_forward=0"; uci delete "$CONFIG.$section.lan_ip" 2>/dev/null; uci delete "$CONFIG.$section.lan_port" 2>/dev/null
+      fi
+      uci commit "$CONFIG"
+      [ "$(uci -q get $CONFIG.main.enabled)" = 1 ] && ( $HELPER request "$port" "$proto" </dev/null 2>&1 | logger -t upnp-client >/dev/null 2>&1 & )      
+      json_result true "Saved $proto port $port.";;
+    remove_mapping)
+      json_get_var section section
+      case "$section" in cfg[0-9a-f]*|'@mapping['[0-9]*']') ;; *) json_result false 'Invalid mapping identifier'; exit 0;; esac
+      [ "$(uci -q get "$CONFIG.$section")" = mapping ] || { json_result false 'Mapping not found'; exit 0; }
+      uci delete "$CONFIG.$section" && uci commit "$CONFIG" && json_result true 'Saved mapping removed. The active router mapping was not deleted.' || json_result false 'Could not remove mapping';;
+    set_auto)
+      json_get_var section section; json_get_var auto auto
+      case "$section" in cfg[0-9a-f]*|'@mapping['[0-9]*']') ;; *) json_result false 'Invalid mapping identifier'; exit 0;; esac
+      [ "$(uci -q get "$CONFIG.$section")" = mapping ] || { json_result false 'Mapping not found'; exit 0; }
+      if [ "$auto" = true ] || [ "$auto" = 1 ]; then auto=1; else auto=0; fi
+      uci set "$CONFIG.$section.auto=$auto" && uci commit "$CONFIG" && json_result true 'Automatic-request setting saved.' || json_result false 'Could not save setting';;
+    request|unrequest)
+      json_get_var port port; json_get_var proto proto
+      if [ "$METHOD" = request ] && [ "$(uci -q get "$CONFIG.main.enabled")" != 1 ]; then json_result false 'Enable UPnP Client before requesting new mappings.'; exit 0; fi
+      valid_port "$port" && valid_proto "$proto" || { json_result false 'Invalid port or protocol'; exit 0; }
+      if [ "$METHOD" = request ]; then output="$($HELPER request "$port" "$proto" 2>&1)"; else output="$($HELPER unrequest "$port" "$proto" 2>&1)"; fi
+      rc=$?; [ "$rc" -eq 0 ] && json_result true "$output" || json_result false "$output";;
+    request_all)
+      [ "$(uci -q get "$CONFIG.main.enabled")" = 1 ] || { json_result false 'Enable UPnP Client before requesting mappings.'; exit 0; }
+      output="$($HELPER request-all 2>&1)"; rc=$?; [ "$rc" -eq 0 ] && json_result true "All saved mappings processed. $output" || json_result false "One or more requests failed. $output";;
+    unrequest_all)
+      output="$($HELPER unrequest-all 2>&1)"; rc=$?; [ "$rc" -eq 0 ] && json_result true "Managed mappings processed. $output" || json_result false "One or more removals failed. $output";;
+    refresh)
+      output="$($HELPER list 2>&1)"; rc=$?
+      [ "$rc" -eq 0 ] && output="$(printf '%s\n' "$output" | grep -E '^ExternalIPAddress|^ *i protocol|^ *[0-9]+ (TCP|UDP)')"
+      json_init; [ "$rc" -eq 0 ] && json_add_boolean ok 1 || json_add_boolean ok 0
+      json_add_string output "$output"; json_dump;;
+    set_router_url)
+      json_get_var url url
+      case "$url" in
+        '') uci -q delete "$CONFIG.main.router_url"; msg='Using auto-detect.';;
+        http://*|https://*) uci set "$CONFIG.main.router_url=$url"; msg='Saved manual override.';;
+        *) json_result false 'URL must start with http:// or https://'; exit 0;;
+      esac
+      uci commit "$CONFIG"; rm -f /tmp/upnp-client-url
+      json_result true "$msg";;
+    nat_status)
+      st="$($HELPER nat-setup status 2>&1)"
+      json_init; json_add_string state "$st"; json_dump;;
+    nat_apply|nat_revert)
+      act="${METHOD#nat_}"
+      output="$($HELPER nat-setup $act 2>&1)"; rc=$?
+      [ "$rc" -eq 0 ] && json_result true "$output" || json_result false "$output";;
+    *) json_result false 'Unknown method';;
+   esac
+   ;;
+ *) exit 1 ;;
+esac

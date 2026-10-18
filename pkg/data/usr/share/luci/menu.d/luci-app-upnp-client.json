@@ -1,0 +1,13 @@
+{
+  "admin/services/upnp-client": {
+    "title": "UPnP Client",
+    "order": 85,
+    "action": {
+      "type": "view",
+      "path": "upnp-client/client"
+    },
+    "depends": {
+      "acl": [ "luci-app-upnp-client" ]
+    }
+  }
+}

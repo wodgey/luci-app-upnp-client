@@ -1,0 +1,25 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+HOOK='/etc/hotplug.d/iface/99-upnp-client'
+TARGET='/usr/lib/upnp-client/hotplug'
+if [ -f "$HOOK" ] && [ ! -L "$HOOK" ]; then
+    BACKUP='/root/99-upnp-client.pre-upnp-client'
+    [ -e "$BACKUP" ] && BACKUP="$BACKUP.$(date +%s)"
+    cp -p "$HOOK" "$BACKUP" 2>/dev/null || exit 1
+    rm -f "$HOOK" || exit 1
+fi
+if [ "$(uci -q get upnp-client.main.enabled)" = '1' ]; then
+    mkdir -p /etc/hotplug.d/iface
+    ln -sf "$TARGET" "$HOOK"
+else
+    [ -L "$HOOK" ] && rm -f "$HOOK"
+fi
+CR=/etc/crontabs/root
+touch "$CR"
+grep -q upnp-client-sync "$CR" || \
+    echo '*/30 * * * * /usr/libexec/upnp-client-sync' >> "$CR"
+/etc/init.d/cron restart >/dev/null 2>&1
+/etc/init.d/upnp-client-watch enable
+/etc/init.d/upnp-client-watch restart
+/etc/init.d/rpcd reload >/dev/null 2>&1 || /etc/init.d/rpcd restart >/dev/null 2>&1
+exit 0

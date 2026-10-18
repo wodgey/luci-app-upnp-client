@@ -1,0 +1,3 @@
+config client 'main'
+	option enabled '0'
+	option wan_interface 'wan'

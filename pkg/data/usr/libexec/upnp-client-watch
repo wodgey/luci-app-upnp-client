@@ -1,0 +1,70 @@
+#!/bin/sh
+# upnp-client-watch
+# Event-driven trigger for upnp-client-sync. Runs as a procd service.
+#
+# `nft monitor rules` prints every nftables rule add/delete as it happens.
+# miniupnpd adds/removes rules in its upnp_* chains when a client opens or
+# closes a port, so any line mentioning "upnp_" means the lease set may have
+# changed. We wait for the burst to settle (DEBOUNCE seconds of quiet, at most
+# MAXWAIT rounds) and then run upnp-client-sync once. The sync script compares
+# against what it last applied and only contacts upstream if something differs,
+# so spurious triggers (e.g. a firewall reload) cost nothing.
+#
+# One sync is also run at start-up, which covers boot.
+
+SYNC=/usr/libexec/upnp-client-sync
+RUN=/var/run/upnp-client-watch
+DEBOUNCE=4
+MAXWAIT=5
+
+FLAG=$RUN.flag
+RUNNER=$RUN.runner
+FIFO=$RUN.fifo
+
+runner_alive() { [ -f "$RUNNER" ] && kill -0 "$(cat "$RUNNER" 2>/dev/null)" 2>/dev/null; }
+
+trigger() {
+	touch "$FLAG"
+	runner_alive && return 0
+	(
+		n=0
+		while :; do
+			rm -f "$FLAG"
+			sleep "$DEBOUNCE"
+			n=$((n + 1))
+			# more events during the wait: wait again, up to MAXWAIT rounds
+			[ -e "$FLAG" ] && [ "$n" -lt "$MAXWAIT" ] && continue
+			n=0
+			"$SYNC"
+			# events that arrived while syncing: go round again
+			[ -e "$FLAG" ] || break
+		done
+		rm -f "$RUNNER"
+		# an event can slip in between the last check and removing RUNNER
+		[ -e "$FLAG" ] && trigger
+	) &
+	echo $! > "$RUNNER"
+}
+
+rm -f "$FIFO" "$FLAG" "$RUNNER"
+mkfifo "$FIFO" || exit 1
+
+nft monitor rules > "$FIFO" 2>/dev/null &
+NFT=$!
+(
+	while read -r line; do
+		case "$line" in *upnp_*) trigger ;; esac
+	done < "$FIFO"
+) &
+READER=$!
+
+STOP=0
+trap 'STOP=1; kill "$NFT" "$READER" 2>/dev/null' TERM INT
+
+trigger   # initial sync at start-up
+wait "$READER"
+kill "$NFT" "$READER" 2>/dev/null
+rm -f "$FIFO"
+[ "$STOP" = 1 ] && exit 0
+sleep 5   # nft monitor ended on its own: pause before procd respawns us
+exit 1

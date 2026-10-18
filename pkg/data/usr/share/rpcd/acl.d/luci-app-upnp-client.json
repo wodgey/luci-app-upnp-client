@@ -1,0 +1,15 @@
+{
+  "luci-app-upnp-client": {
+    "description": "Manage upstream UPnP client mappings",
+    "read": {
+      "ubus": {
+        "upnp-client": [ "status", "mappings", "refresh", "nat_status" ]
+      }
+    },
+    "write": {
+      "ubus": {
+        "upnp-client": [ "set_enabled", "add_mapping", "remove_mapping", "set_auto", "request", "unrequest", "request_all", "unrequest_all", "set_router_url", "nat_apply", "nat_revert" ]
+      }
+    }
+  }
+}

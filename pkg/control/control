@@ -1,0 +1,10 @@
+Package: luci-app-upnp-client
+Version: 1.1.0-2
+Depends: libc, rpcd, luci-base, miniupnpc, miniupnpd-nftables, firewall4, curl, jshn
+Section: luci
+Category: LuCI
+Architecture: all
+Maintainer: Local OpenWrt package
+Description: LuCI manager for upstream UPnP port mappings
+ Finds the upstream NAT router, requests saved mappings, and relays
+ UPnP/NAT-PMP leases from LAN devices to it. Needs firewall4.

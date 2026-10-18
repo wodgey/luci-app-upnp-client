@@ -1,0 +1,14 @@
+#!/bin/sh
+[ -n "$IPKG_INSTROOT" ] && exit 0
+/etc/init.d/upnp-client-watch stop >/dev/null 2>&1
+/etc/init.d/upnp-client-watch disable >/dev/null 2>&1
+HOOK='/etc/hotplug.d/iface/99-upnp-client'
+[ -L "$HOOK" ] && rm -f "$HOOK"
+sed -i '/upnp-client-sync/d' /etc/crontabs/root 2>/dev/null
+/etc/init.d/cron restart >/dev/null 2>&1
+if uci -q get firewall.upnpclient_ssdp >/dev/null; then
+    uci -q delete firewall.upnpclient_ssdp
+    uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1
+fi
+exit 0

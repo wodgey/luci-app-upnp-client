@@ -1,0 +1,255 @@
+#!/bin/sh
+# Shared request implementation for LuCI RPC and WAN hotplug.
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+CONFIG='upnp-client'
+ensure_ssdp_rule() {
+    local gw cur
+    network_get_gateway gw "$WAN_IF"
+    [ -n "$gw" ] || return 1
+    cur="$(uci -q get firewall.upnpclient_ssdp.src_ip)"
+    [ "$cur" = "$gw" ] && return 0
+    uci set firewall.upnpclient_ssdp=rule
+    uci set firewall.upnpclient_ssdp.name='UPnPClient-SSDP-Reply'
+    uci set firewall.upnpclient_ssdp.src='wan'
+    uci set firewall.upnpclient_ssdp.src_ip="$gw"
+    uci set firewall.upnpclient_ssdp.src_port='1900'
+    uci set firewall.upnpclient_ssdp.proto='udp'
+    uci set firewall.upnpclient_ssdp.target='ACCEPT'
+    uci set firewall.upnpclient_ssdp.upnp_client_managed='1'
+    uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1
+}
+remove_ssdp_rule() {
+    uci -q get firewall.upnpclient_ssdp >/dev/null || return 0
+    uci -q delete firewall.upnpclient_ssdp
+    uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1
+}
+WAN_IF="$(uci -q get "$CONFIG.main.wan_interface")"
+[ -n "$WAN_IF" ] || WAN_IF='wan'
+URL="$(uci -q get "$CONFIG.main.router_url")"
+URL_CACHE=/tmp/upnp-client-url
+is_igd() { curl -s -m 3 "$1" 2>/dev/null | grep -q 'InternetGatewayDevice'; }
+discover_url() {
+    local gw ip p u c
+    c="$(cat "$URL_CACHE" 2>/dev/null)"
+    if [ -n "$c" ] && is_igd "$c"; then echo "$c"; return 0; fi
+    ip="$(wan_ip)" || return 1
+    ensure_ssdp_rule >/dev/null 2>&1
+    u="$(upnpc -m "$ip" -l 2>/dev/null | sed -n 's/^.*desc: *//p' | head -n 1)"
+    if [ -n "$u" ]; then logger -t upnp-client "upstream found by search: $u"; echo "$u" > "$URL_CACHE"; echo "$u"; return 0; fi
+    network_get_gateway gw "$WAN_IF"
+    if [ -n "$gw" ]; then
+        for p in 5000 49152 52869 37215 2869 8080 80; do
+            u="http://$gw:$p/rootDesc.xml"
+            if is_igd "$u"; then logger -t upnp-client "upstream found by port guess: $u"; echo "$u" > "$URL_CACHE"; echo "$u"; return 0; fi
+        done
+    fi
+    return 1
+}
+discover_url_old() {
+    local gw ip p u c
+    c="$(cat "$URL_CACHE" 2>/dev/null)"
+    if [ -n "$c" ] && is_igd "$c"; then echo "$c"; return 0; fi
+    network_get_gateway gw "$WAN_IF"
+    if [ -n "$gw" ]; then
+        for p in 5000 49152 52869 37215 2869 8080 80; do
+            u="http://$gw:$p/rootDesc.xml"
+            if is_igd "$u"; then echo "$u" > "$URL_CACHE"; echo "$u"; return 0; fi
+        done
+    fi
+    ip="$(wan_ip)" || return 1
+    ensure_ssdp_rule >/dev/null 2>&1
+    u="$(upnpc -m "$ip" -l 2>/dev/null | sed -n 's/^.*desc: *//p' | head -n 1)"
+    [ -n "$u" ] || return 1
+    echo "$u" > "$URL_CACHE"; echo "$u"
+}
+resolve_url() {
+    [ -n "$1" ] || return 0
+    [ -n "$URL" ] || URL="$(discover_url)"
+    [ -n "$URL" ] || { echo 'Could not find an upstream UPnP router. Set router_url in /etc/config/upnp-client.'; exit 1; }
+}
+
+wan_ip() {
+    local ip=''
+    network_get_ipaddr ip "$WAN_IF" || return 1
+    [ -n "$ip" ] || return 1
+    printf '%s\n' "$ip"
+}
+valid_port() { case "${1:-}" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null; }
+valid_proto() { [ "${1:-}" = TCP ] || [ "${1:-}" = UDP ]; }
+apply_local_forward() {
+    local port="$1" proto="$2" section lan_forward lan_ip lan_port fwname
+    for section in $(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=mapping$/\1/p"); do
+        [ "$(uci -q get "$CONFIG.$section.port")" = "$port" ] || continue
+        [ "$(uci -q get "$CONFIG.$section.proto")" = "$proto" ] || continue
+        lan_forward="$(uci -q get "$CONFIG.$section.lan_forward")"
+        [ "$lan_forward" = 1 ] || return 0
+        lan_ip="$(uci -q get "$CONFIG.$section.lan_ip")"
+        lan_port="$(uci -q get "$CONFIG.$section.lan_port")"
+        valid_port "$lan_port" || { echo "Upstream mapping succeeded, but LAN forwarding failed: invalid LAN port"; return 1; }
+        # OpenWrt firewall4 redirect rules are IPv4 NAT redirects. Keep IPv6 input
+        # accepted/stored, but never silently create a misleading IPv4 redirect.
+        case "$lan_ip" in *:*) echo "Upstream mapping succeeded; LAN forward not created because this firewall redirect path supports IPv4 targets only (configured target is IPv6)."; return 1;; esac
+        echo "$lan_ip" | awk -F. 'NF != 4 { exit 1 } { for (i=1;i<=4;i++) if ($i !~ /^[0-9]+$/ || $i < 0 || $i > 255) exit 1 }' || { echo "Upstream mapping succeeded, but LAN forwarding failed: invalid IPv4 LAN address"; return 1; }
+        fwname="upnpclient_${port}_$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+        uci -q delete "firewall.$fwname" 2>/dev/null
+        uci set "firewall.$fwname=redirect" || return 1
+        uci set "firewall.$fwname.name=UPnPClient-$port-$proto" || return 1
+        uci set "firewall.$fwname.src=wan"
+        uci set "firewall.$fwname.dest=lan"
+        uci set "firewall.$fwname.proto=$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+        uci set "firewall.$fwname.src_dport=$port"
+        uci set "firewall.$fwname.dest_ip=$lan_ip"
+        uci set "firewall.$fwname.dest_port=$lan_port"
+        uci set "firewall.$fwname.upnp_client_managed=1"
+        uci commit firewall || return 1
+        /etc/init.d/firewall reload >/dev/null 2>&1 || { echo "Upstream mapping succeeded, but firewall reload failed"; return 1; }
+        echo "LAN forward applied to $lan_ip:$lan_port."
+        return 0
+    done
+    return 0
+}
+request_mapping() {
+    local port="$1" proto="$2" ip output rc local_rc
+    valid_port "$port" && valid_proto "$proto" || { echo 'Invalid port or protocol'; return 2; }
+    ip="$(wan_ip)" || { echo "Could not determine IPv4 address for logical interface $WAN_IF"; return 1; }
+    output="$(upnpc -u "$URL" -a "$ip" "$port" "$port" "$proto" 2>&1)"; rc=$?
+    printf '%s\n' "$output"
+    [ "$rc" -eq 0 ] || return "$rc"
+    local_output="$(apply_local_forward "$port" "$proto" 2>&1)"; local_rc=$?
+    [ -n "$local_output" ] && printf '%s\n' "$local_output"
+    return "$local_rc"
+}
+unrequest_mapping() {
+    local port="$1" proto="$2" output rc fwname
+    valid_port "$port" && valid_proto "$proto" || { echo 'Invalid port or protocol'; return 2; }
+    output="$(upnpc -u "$URL" -d "$port" "$proto" 2>&1)"; rc=$?
+    printf '%s\n' "$output"
+    fwname="upnpclient_${port}_$(printf '%s' "$proto" | tr 'A-Z' 'a-z')"
+    if [ "$(uci -q get "firewall.$fwname.upnp_client_managed")" = 1 ]; then
+        uci -q delete "firewall.$fwname" && uci commit firewall && /etc/init.d/firewall reload >/dev/null 2>&1 || { echo 'Removed upstream mapping, but failed to remove the package-owned LAN redirect'; return 1; }
+        echo 'Package-owned LAN redirect removed.'
+    fi
+    return "$rc"
+}
+UCONF=/etc/miniupnpd.custom.conf
+GEN=/var/etc/miniupnpd.conf
+nat_state() {
+    local cf
+    cf="$(uci -q get upnpd.config.config_file)"
+    [ -n "$cf" ] && [ -f "$cf" ] || { echo not-applied; return 0; }
+    grep -q '^ext_allow_private_ipv4=yes' "$cf" && echo applied || echo not-applied
+}
+nat_setopt() {
+    if grep -q '^ext_allow_private_ipv4=' "$1"; then
+        sed -i 's/^ext_allow_private_ipv4=.*/ext_allow_private_ipv4=yes/' "$1"
+    else
+        echo 'ext_allow_private_ipv4=yes' >> "$1"
+    fi
+}
+nat_apply() {
+    local cf
+    [ "$(nat_state)" = applied ] && { echo 'Already applied.'; return 0; }
+    cf="$(uci -q get upnpd.config.config_file)"
+    uci set upnp-client.main.nat_prev_conf="$cf"
+    if [ -n "$cf" ] && [ -f "$cf" ]; then
+        cp -p "$cf" "$cf.pre-upnp-client" || return 1
+        nat_setopt "$cf"
+    else
+        [ -f "$GEN" ] || { /etc/init.d/miniupnpd restart >/dev/null 2>&1; sleep 3; }
+        [ -f "$GEN" ] || { echo 'miniupnpd has no generated config. Is it installed and enabled?'; return 1; }
+        [ -f "$UCONF" ] && cp -p "$UCONF" "$UCONF.pre-upnp-client"
+        cp "$GEN" "$UCONF" || return 1
+        nat_setopt "$UCONF"
+        uci set upnpd.config.config_file="$UCONF"
+        uci commit upnpd
+    fi
+    uci commit upnp-client
+    /etc/init.d/miniupnpd restart >/dev/null 2>&1
+    rm -f /tmp/upnp-client-sync.extip_checked
+    echo 'Applied. miniupnpd now accepts a private WAN address.'
+}
+nat_revert() {
+    local cf prev
+    [ "$(nat_state)" = applied ] || { echo 'Not applied; nothing to undo.'; return 0; }
+    cf="$(uci -q get upnpd.config.config_file)"
+    prev="$(uci -q get upnp-client.main.nat_prev_conf)"
+    if [ -n "$prev" ] && [ -f "$prev.pre-upnp-client" ]; then
+        cp -p "$prev.pre-upnp-client" "$prev"
+        echo 'Reverted. Your earlier custom config was restored.'
+    else
+        uci -q delete upnpd.config.config_file
+        uci commit upnpd
+        echo "Reverted. The copy at $cf is kept but no longer used."
+    fi
+    uci -q delete upnp-client.main.nat_prev_conf
+    uci commit upnp-client
+    /etc/init.d/miniupnpd restart >/dev/null 2>&1
+}
+case "${1:-}" in
+  nat-setup)
+    case "${2:-}" in
+      status) nat_state ;;
+      apply) nat_apply ;;
+      revert) nat_revert ;;
+      *) echo 'Usage: nat-setup status|apply|revert'; exit 2 ;;
+    esac
+    exit $? ;;
+esac
+resolve_url "${1:-}"; case "${1:-}" in
+  request) request_mapping "${2:-}" "${3:-}"; exit $? ;;
+  unrequest) unrequest_mapping "${2:-}" "${3:-}"; exit $? ;;
+  list) upnpc -u "$URL" -l 2>&1; exit $? ;;
+  ssdp-rule) case "${2:-}" in add) ensure_ssdp_rule;; remove) remove_ssdp_rule;; esac; exit $? ;;
+  request-auto)
+    [ "$(uci -q get "$CONFIG.main.enabled")" = '1' ] || exit 0
+    ensure_ssdp_rule >/dev/null 2>&1
+    result=0
+    while IFS=' ' read -r port proto; do
+      [ -n "$port" ] || continue
+      output="$(request_mapping "$port" "$proto")"; rc=$?
+      logger -t upnp-client "automatic request $proto/$port exit=$rc: $(echo "$output" | tr '\n' ' ' | cut -c1-240)"
+      [ "$rc" -eq 0 ] || result=1
+    done <<EOF_MAPS
+$(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=mapping$/\1/p" | while IFS= read -r section; do
+  port="$(uci -q get "$CONFIG.$section.port")"
+  proto="$(uci -q get "$CONFIG.$section.proto")"
+  auto="$(uci -q get "$CONFIG.$section.auto")"
+  [ "$auto" = '1' ] && printf '%s %s\n' "$port" "$proto"
+done)
+EOF_MAPS
+    exit "$result"
+    ;;
+  request-all)
+    result=0
+    while IFS=' ' read -r port proto; do
+      [ -n "$port" ] || continue
+      output="$(request_mapping "$port" "$proto")"; rc=$?
+      logger -t upnp-client "manual request $proto/$port exit=$rc: $(echo "$output" | tr '\n' ' ' | cut -c1-240)"
+      [ "$rc" -eq 0 ] || result=1
+    done <<EOF_MAPS
+$(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=mapping$/\1/p" | while IFS= read -r section; do
+  printf '%s %s\n' "$(uci -q get "$CONFIG.$section.port")" "$(uci -q get "$CONFIG.$section.proto")"
+done)
+EOF_MAPS
+    exit "$result"
+    ;;
+  unrequest-all)
+    result=0
+    while IFS=' ' read -r port proto; do
+      [ -n "$port" ] || continue
+      output="$(unrequest_mapping "$port" "$proto")"; rc=$?
+      logger -t upnp-client "unrequest managed mapping $proto/$port exit=$rc: $(echo "$output" | tr '\n' ' ' | cut -c1-240)"
+      [ "$rc" -eq 0 ] || result=1
+    done <<EOF_MAPS
+$(uci -q show "$CONFIG" | sed -n "s/^$CONFIG\.\([^.=]*\)=mapping$/\1/p" | while IFS= read -r section; do
+  printf '%s %s\n' "$(uci -q get "$CONFIG.$section.port")" "$(uci -q get "$CONFIG.$section.proto")"
+done)
+EOF_MAPS
+    exit "$result"
+    ;;
+  *) echo 'Usage: upnp-client-request {request PORT TCP|UDP|unrequest PORT TCP|UDP|list|request-auto|unrequest-all}'; exit 2 ;;
+esac

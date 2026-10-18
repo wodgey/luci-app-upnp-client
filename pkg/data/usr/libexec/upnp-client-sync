@@ -1,0 +1,210 @@
+#!/bin/sh
+# upnp-client-sync
+# Cron companion to /usr/libexec/upnp-client-request (luci-app-upnp-client).
+#
+# Every run (cron, once a minute) it reads LOCAL state only:
+#   - saved mappings with auto=1 in /etc/config/upnp-client
+#   - (optional) active miniupnpd leases in /var/run/miniupnpd.leases
+# and compares that set with the set it last applied upstream.
+# If nothing changed it exits without sending anything to the upstream router.
+# If something changed it sends only the difference, through the package
+# helper: request for new ports, unrequest for lease ports that went away.
+#
+# Optional UCI options in upnp-client.main:
+#   mirror_leases   1|0   pass miniupnpd leases upstream            (default 1)
+#   mirror_min_port N     ignore leases below this port             (default 1024)
+#   verify_minutes  N     every N minutes ask upstream what it holds and
+#                         re-request anything missing; 0 = never    (default 0)
+#   extip_minutes   N     at most every N minutes ask the upstream router for its
+#                         public IP; if it differs from ext_ip= in the miniupnpd
+#                         config file (upnpd.config.config_file) update that line
+#                         and restart miniupnpd; 0 = off            (default 30)
+#                         Every change is also appended to /etc/upnp-client-extip.history
+
+. /lib/functions.sh
+. /lib/functions/network.sh
+
+CONFIG=upnp-client
+HELPER=/usr/libexec/upnp-client-request
+LEASES=/var/run/miniupnpd.leases
+LOCKF=/var/lock/upnp-client-sync.lock
+T=/tmp/upnp-client-sync
+APPLIED=$T.applied   # "PROTO port S|L": last applied upstream (S=saved, L=lease)
+FAILF=$T.fail        # "PROTO port epoch": recent failures, retried after 10 min
+
+log() { logger -t upnp-client-sync "$*"; }
+tmo() { if command -v timeout >/dev/null 2>&1; then timeout 25 "$@"; else "$@"; fi; }
+
+[ -x "$HELPER" ] || exit 0
+[ "$(uci -q get $CONFIG.main.enabled)" = 1 ] || exit 0
+
+lock -n "$LOCKF" 2>/dev/null || exit 0
+trap 'lock -u "$LOCKF"' EXIT
+
+MIRROR="$(uci -q get $CONFIG.main.mirror_leases)"; [ -n "$MIRROR" ] || MIRROR=1
+MINPORT="$(uci -q get $CONFIG.main.mirror_min_port)"
+case "$MINPORT" in ''|*[!0-9]*) MINPORT=1024 ;; esac
+VERIFY="$(uci -q get $CONFIG.main.verify_minutes)"
+case "$VERIFY" in ''|*[!0-9]*) VERIFY=0 ;; esac
+WAN_IF="$(uci -q get $CONFIG.main.wan_interface)"; [ -n "$WAN_IF" ] || WAN_IF=wan
+NOW=$(date +%s)
+URL="$(uci -q get $CONFIG.main.router_url)"
+[ -n "$URL" ] || { "$HELPER" list >/dev/null 2>&1; URL="$(cat /tmp/upnp-client-url 2>/dev/null)"; }
+
+# --- 0. upstream public IP tracking (time-gated; the one upstream query made
+#        even when no port changed) ------------------------------------------
+EXTIP_MIN="$(uci -q get $CONFIG.main.extip_minutes)"
+case "$EXTIP_MIN" in ''|*[!0-9]*) EXTIP_MIN=30 ;; esac
+EXTIP_STAMP=$T.extip_checked
+EXTIP_HIST=/etc/upnp-client-extip.history
+MCONF="$(uci -q get upnpd.config.config_file)"
+
+is_public_v4() {
+	printf '%s' "$1" | grep -qE '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+	case "$1" in
+		0.*|10.*|127.*|169.254.*|192.168.*) return 1 ;;
+		22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) return 1 ;;
+		172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;;
+		100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1 ;;
+	esac
+	return 0
+}
+
+check_extip() {
+	local last ip cur lastrec
+	[ "$EXTIP_MIN" -gt 0 ] || return 0
+	[ -n "$MCONF" ] && [ -w "$MCONF" ] || return 0
+	grep -q '^ext_perform_stun=yes' "$MCONF" && return 0
+	last="$(cat "$EXTIP_STAMP" 2>/dev/null)"
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	[ $((NOW - last)) -ge $((EXTIP_MIN * 60 - 60)) ] || return 0
+	echo "$NOW" > "$EXTIP_STAMP"
+	# upnpc -s line:  "ExternalIPAddress = 203.0.113.7"
+	ip="$(tmo upnpc -u "$URL" -s 2>/dev/null | sed -n 's/^ExternalIPAddress = \([0-9.]*\)$/\1/p' | head -1)"
+	[ -n "$ip" ] || { log "external IP check: upstream returned no address"; return 0; }
+	if ! is_public_v4 "$ip"; then
+		if [ "$(cat "$EXTIP_STAMP.warn" 2>/dev/null)" != "$ip" ]; then
+			log "upstream reports $ip, which is not a public address (CGNAT?); ext_ip left unchanged"
+			echo "$ip" > "$EXTIP_STAMP.warn"
+		fi
+		return 0
+	fi
+	rm -f "$EXTIP_STAMP.warn"
+	lastrec="$(tail -n 1 "$EXTIP_HIST" 2>/dev/null | awk '{print $3}')"
+	if [ "$lastrec" != "$ip" ]; then
+		if [ -n "$lastrec" ]; then echo "$(date '+%F %T') $ip (was $lastrec)" >> "$EXTIP_HIST"
+		else echo "$(date '+%F %T') $ip (first seen)" >> "$EXTIP_HIST"; fi
+	fi
+	cur="$(sed -n 's/^ext_ip=//p' "$MCONF" | tail -n 1)"
+	[ "$cur" = "$ip" ] && return 0
+	if grep -q '^ext_ip=' "$MCONF"; then
+		sed -i "s/^ext_ip=.*/ext_ip=$ip/" "$MCONF"
+	else
+		echo "ext_ip=$ip" >> "$MCONF"
+	fi
+	log "external IP changed ${cur:-none} -> $ip; updated $MCONF, restarting miniupnpd"
+	/etc/init.d/miniupnpd restart >/dev/null 2>&1
+}
+check_extip
+
+# --- 1. what we want upstream (local reads only) ---------------------------
+: > "$T.saved"
+set -f	# section names like @mapping[0] must not be glob-expanded
+# `uci show` prints unnamed sections as @mapping[N] (not cfgXXXXXX), so accept any name
+for s in $(uci -q show $CONFIG | sed -n "s/^$CONFIG\.\([^.=]*\)=mapping$/\1/p"); do
+	[ "$(uci -q get "$CONFIG.$s.auto")" = 1 ] || continue
+	p="$(uci -q get "$CONFIG.$s.port")"; pr="$(uci -q get "$CONFIG.$s.proto")"
+	case "$p" in ''|*[!0-9]*) continue ;; esac
+	case "$pr" in TCP|UDP) echo "$pr $p S" >> "$T.saved" ;; esac
+done
+
+# miniupnpd lease line: PROTO:extport:intaddr:intport:expiry:description
+: > "$T.leased"
+if [ "$MIRROR" = 1 ] && [ -r "$LEASES" ]; then
+	awk -F: -v now="$NOW" -v min="$MINPORT" '
+		($1=="TCP" || $1=="UDP") && $2 ~ /^[0-9]+$/ && $2+0 >= min && $2+0 <= 65535 \
+		&& ($5+0 == 0 || $5+0 > now) { print $1, $2, "L" }' "$LEASES" > "$T.leased"
+fi
+
+# saved first, so a port that is both saved and leased counts as saved
+cat "$T.saved" "$T.leased" | awk '!seen[$1" "$2]++' | sort > "$T.want"
+
+# --- 2. difference against what was last applied ---------------------------
+[ -f "$APPLIED" ] || : > "$APPLIED"
+[ -f "$FAILF" ] || : > "$FAILF"
+awk 'FILENAME==ARGV[1] { a[$1" "$2]=1; next } !(($1" "$2) in a)' "$APPLIED" "$T.want" > "$T.added"
+awk 'FILENAME==ARGV[1] { w[$1" "$2]=1; next } $3=="L" && !(($1" "$2) in w)' "$T.want" "$APPLIED" > "$T.removed"
+# saved mappings switched off: forget locally, never delete upstream (package semantics)
+awk 'FILENAME==ARGV[1] { w[$1" "$2]=1; next } $3=="S" && !(($1" "$2) in w)' "$T.want" "$APPLIED" > "$T.stale"
+
+DUE=0
+if [ "$VERIFY" -gt 0 ] && [ -s "$T.want" ]; then
+	last="$(cat "$T.verified" 2>/dev/null)"
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	[ $((NOW - last)) -ge $((VERIFY * 60)) ] && DUE=1
+fi
+
+# Nothing changed: stay silent and do not contact upstream.
+if [ ! -s "$T.added" ] && [ ! -s "$T.removed" ] && [ ! -s "$T.stale" ] && [ "$DUE" = 0 ]; then exit 0; fi
+
+# --- 3. optional periodic check that upstream still holds our ports --------
+if [ "$DUE" = 1 ]; then
+	echo "$NOW" > "$T.verified"
+	network_flush_cache
+	network_get_ipaddr WAN_IP "$WAN_IF"
+	if [ -n "$WAN_IP" ] && LIST="$(tmo "$HELPER" list 2>&1)"; then
+		while read -r pr port src; do
+			[ -n "$port" ] || continue
+			grep -q "^$pr $port " "$T.added" && continue
+			# upnpc -l line:  " 0 TCP 59239->192.168.1.206:59239 'desc' '' 0"
+			printf '%s\n' "$LIST" | grep -qiE "[[:space:]]$pr[[:space:]]+$port->$WAN_IP:$port([[:space:]]|\$)" \
+				|| echo "$pr $port $src" >> "$T.added"
+		done < "$T.want"
+	else
+		log "verify skipped: upstream unreachable or no WAN address"
+	fi
+fi
+
+backed_off() { # PROTO port -> true while inside the 10-minute retry window
+	local lf
+	lf="$(awk -v a="$1" -v b="$2" '$1==a && $2==b {print $3}' "$FAILF")"
+	[ -n "$lf" ] && [ $((NOW - lf)) -lt 600 ]
+}
+note_result() { # PROTO port rc
+	sed -i "/^$1 $2 /d" "$FAILF"
+	[ "$3" -eq 0 ] || echo "$1 $2 $NOW" >> "$FAILF"
+}
+
+# --- 4. send only the difference -------------------------------------------
+: > "$T.okadds"
+while read -r pr port src; do
+	[ -n "$port" ] || continue
+	backed_off "$pr" "$port" && continue
+	out="$(tmo "$HELPER" request "$port" "$pr" 2>&1)"; rc=$?
+	log "request $pr/$port exit=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+	note_result "$pr" "$port" "$rc"
+	[ "$rc" -eq 0 ] && echo "$pr $port" >> "$T.okadds"
+done < "$T.added"
+
+: > "$T.keep"
+while read -r pr port src; do
+	[ -n "$port" ] || continue
+	if backed_off "$pr" "$port"; then echo "$pr $port $src" >> "$T.keep"; continue; fi
+	out="$(tmo "$HELPER" unrequest "$port" "$pr" 2>&1)"; rc=$?
+        [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q 'code : 714' && rc=0
+	log "unrequest $pr/$port exit=$rc: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+	note_result "$pr" "$port" "$rc"
+	[ "$rc" -eq 0 ] || echo "$pr $port $src" >> "$T.keep"
+done < "$T.removed"
+
+# --- 5. record what is now applied -----------------------------------------
+: > "$T.new"
+while read -r pr port src; do
+	[ -n "$port" ] || continue
+	if grep -q "^$pr $port " "$APPLIED" || grep -qx "$pr $port" "$T.okadds"; then
+		echo "$pr $port $src" >> "$T.new"
+	fi
+done < "$T.want"
+cat "$T.keep" >> "$T.new"
+mv "$T.new" "$APPLIED"
+exit 0

@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+# Event-driven trigger for upnp-client-sync (see /usr/libexec/upnp-client-watch).
+# Always runs; the sync script itself checks upnp-client.main.enabled.
+START=99
+STOP=10
+USE_PROCD=1
+
+start_service() {
+	command -v nft >/dev/null 2>&1 || { echo "nft not found"; return 1; }
+	procd_open_instance
+	procd_set_param command /usr/libexec/upnp-client-watch
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+# A "Save & Apply" on the upnp-client config restarts the watcher, whose
+# start-up sync picks up the new saved mappings.
+service_triggers() {
+	procd_add_reload_trigger upnp-client
+}
