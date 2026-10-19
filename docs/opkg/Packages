@@ -1,0 +1,16 @@
+Package: luci-app-upnp-client
+Version: 1.3.0-2
+Depends: libc, rpcd, luci-base, miniupnpc, miniupnpd-nftables, firewall4, curl, jshn
+Installed-Size: 47112
+Section: luci
+Category: LuCI
+Architecture: all
+Maintainer: Local OpenWrt package
+Description: Insanely useful relay sitting between upnpd and upnpc, in a double-NAT environment.
+ Adds a manual "Request from upstream and forward to LAN port" feature,
+ and relays UPnP/NAT-PMP requests from LAN devices to the upstream NAT router.
+ Needs firewall4.
+Filename: luci-app-upnp-client_1.3.0-2_all.ipk
+Size: 15166
+SHA256sum: bda6a3c64fd0dc6413effe634a28d84ac7cd1c900f92a9995784b01d1868771e
+
