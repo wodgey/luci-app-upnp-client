@@ -2,9 +2,12 @@
 set -e
 cd "$(dirname "$0")"
 V=$(sed -n 's/^Version: //p' pkg/control/control)
-rm -rf build && mkdir build
+rm -rf build && mkdir -p build/control
+cp -r pkg/control/. build/control/
+S=$(find pkg/data -type f -printf '%s\n' | awk '{s+=$1} END{print s}')
+sed -i "/^Section:/i Installed-Size: $S" build/control/control
 echo 2.0 > build/debian-binary
-tar czf build/control.tar.gz --owner=0 --group=0 -C pkg/control .
+tar czf build/control.tar.gz --owner=0 --group=0 -C build/control .
 tar czf build/data.tar.gz --owner=0 --group=0 -C pkg/data .
 cd build
 tar czf "../luci-app-upnp-client_${V}_all.ipk" --owner=0 --group=0 \

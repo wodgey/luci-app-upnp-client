@@ -23,7 +23,7 @@ reach the upstream NAT router.
 
 ## Install
 
-    opkg install luci-app-upnp-client_1.3.0-1_all.ipk
+    opkg install luci-app-upnp-client_1.3.0-2_all.ipk
 
 Then open Services, UPnP Client in LuCI. The switch starts off.
 
